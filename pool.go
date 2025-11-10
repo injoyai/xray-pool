@@ -1,0 +1,408 @@
+package xray_pool
+
+import (
+	"fmt"
+	"github.com/injoyai/base/types"
+	"github.com/injoyai/logs"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const (
+	DefaultConfigDir = "./config/"
+	DefaultStartPort = 50000
+	DefaultPoolCap   = 1000
+	DefaultTimeout   = time.Second * 5
+)
+
+var (
+	XrayCmd  = []string{"./bin/xray", "run", "-config"}
+	V2rayCmd = []string{"v2ray", "-config"}
+)
+
+type Option func(*Pool)
+
+func WithSubscribe(subscribe ...string) Option {
+	return func(p *Pool) {
+		p.subscribes = subscribe
+	}
+}
+
+func WithNode(node ...string) Option {
+	return func(p *Pool) {
+		p.nodeUrls = append(p.nodeUrls, node...)
+	}
+}
+
+func WithConfigDir(dir string) Option {
+	return func(p *Pool) {
+		p.configDir = dir
+	}
+}
+
+func WithStartPort(port int) Option {
+	return func(p *Pool) {
+		p.startPort = port
+	}
+}
+
+func WithCheck(check CheckFunc) Option {
+	return func(p *Pool) {
+		p.checkFunc = check
+	}
+}
+
+func WithPoolCap(cap int) Option {
+	return func(p *Pool) {
+		if cap >= 0 && cap != len(p.pool) {
+			old := p.pool
+			p.pool = make(chan *Node, cap)
+			for n := range old {
+				p.Put(n)
+			}
+			close(old)
+		}
+	}
+}
+
+// WithCmd 设置启动命令
+// xray run -config
+// v2ray -config
+func WithCmd(cmd []string) Option {
+	return func(p *Pool) {
+		p.cmd = cmd
+	}
+}
+
+func New(op ...Option) *Pool {
+	p := &Pool{
+		configDir: DefaultConfigDir,
+		startPort: DefaultStartPort,
+		checkFunc: ByPing,
+		pool:      make(chan *Node, DefaultPoolCap),
+		cmd:       XrayCmd,
+		done:      make(chan struct{}),
+	}
+	for _, o := range op {
+		o(p)
+	}
+	return p
+}
+
+type Pool struct {
+	subscribes []string  //订阅地址
+	nodeUrls   []string  //节点地址
+	configDir  string    //配置目录
+	startPort  int       //起始端口
+	checkFunc  CheckFunc //检查节点是否可用,ping,tcp,download等
+	cmd        []string  //启动命令
+
+	pool  chan *Node        //代理池
+	nodes types.List[*Node] //节点
+	done  chan struct{}     //
+}
+
+func (p *Pool) Get() *Node {
+	node := <-p.pool
+	return node
+}
+
+func (p *Pool) Put(n *Node) {
+	p.pool <- n
+}
+
+func (p *Pool) Len() int {
+	return len(p.pool)
+}
+
+func (p *Pool) Do(f func(n *Node) error) error {
+	n := p.Get()
+	defer p.Put(n)
+	return f(n)
+}
+
+func (p *Pool) Run() error {
+	p.Close()
+
+	//获取所有地址,去重
+	m := p.subscribe()
+
+	//解析节点信息
+	logs.Info("parse...")
+	p.parse(m)
+
+	//校验节点
+	logs.Info("check...")
+	p.check()
+
+	//开始启动
+	logs.Info("start...")
+	p.start()
+
+	p.done = make(chan struct{})
+
+	exitChan := make(chan os.Signal)
+	signal.Notify(exitChan, os.Interrupt, os.Kill, syscall.SIGTERM)
+	go func() { <-exitChan; p.Close() }()
+
+	//if len(p.pool) == 0 {
+	//	return fmt.Errorf("pool is empty")
+	//}
+
+	<-p.done
+
+	return nil
+}
+
+func (p *Pool) Close() error {
+	for _, n := range p.nodes {
+		n.Stop()
+	}
+	if p.done != nil {
+		close(p.done)
+	}
+	return os.RemoveAll(p.configDir)
+}
+
+func (p *Pool) subscribe() map[string]struct{} {
+	m := make(map[string]struct{})
+	for _, u := range p.subscribes {
+		ls, err := p.get(u)
+		if err != nil {
+			logs.Err(err)
+			continue
+		}
+		for _, l := range ls {
+			if len(l) > 0 {
+				m[l] = struct{}{}
+			}
+		}
+	}
+	for _, u := range p.nodeUrls {
+		m[u] = struct{}{}
+	}
+	return m
+}
+
+func (p *Pool) get(u string) ([]string, error) {
+	resp, err := http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	bs, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	ls := strings.Split(string(bs), "\n")
+	return ls, nil
+}
+
+func (p *Pool) parse(m map[string]struct{}) {
+	for u, _ := range m {
+		n, err := p.parseNode(u)
+		if err != nil {
+			logs.Warn(err)
+			continue
+		}
+		p.nodes = append(p.nodes, n)
+	}
+}
+
+func (p *Pool) parseNode(u string) (*Node, error) {
+	n := &Node{
+		url:        u,
+		listenPort: -1,
+		fail:       make(map[string]int),
+		alive:      true,
+	}
+	if err := n.parse(); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func (p *Pool) check() {
+	if p.checkFunc == nil {
+		p.checkFunc = ByPing
+	}
+	logs.Info(len(p.nodes), " nodes")
+	wg := sync.WaitGroup{}
+	for _, n := range p.nodes {
+		if n == nil {
+			logs.Debug("n is nil")
+		}
+		wg.Add(1)
+		go func(n *Node) {
+			defer wg.Done()
+			err := n.Check(p.checkFunc)
+			if err != nil {
+				logs.Warn(err)
+			}
+		}(n)
+	}
+	wg.Wait()
+	p.nodes.Sort(func(a, b *Node) bool {
+		//if a.c
+		return a.checkSpend < b.checkSpend
+	})
+	for i, v := range p.nodes {
+		logs.Info(v.checkSpend)
+		if i >= 10 {
+			break
+		}
+	}
+}
+
+func (p *Pool) start() {
+	if len(p.nodes) == 0 {
+		return
+	}
+
+	os.MkdirAll(p.configDir, os.ModePerm)
+	port := p.startPort
+	wg := sync.WaitGroup{}
+	wg.Add(len(p.nodes))
+	for _, n := range p.nodes {
+		if !n.Valid() {
+			logs.Warn("node is invalid")
+			wg.Done()
+			continue
+		}
+
+		go func(n *Node, port int) {
+			defer wg.Done()
+			if err := n.Start(port, p.configDir, p.cmd); err != nil {
+				logs.Warn(err)
+				return
+			}
+			p.pool <- n
+		}(n, port)
+		port++
+	}
+	wg.Done()
+}
+
+type Node struct {
+	Vnexter
+
+	name       string
+	url        string         // 原始 vmess:// 链接
+	listenPort int            // 本地 V2Ray 实例端口
+	process    *exec.Cmd      // 本地 V2Ray 进程
+	alive      bool           // 激活
+	fail       map[string]int // 请求地址对应的失败次数
+	failLimit  int            // 失败次数限制
+	checkSpend time.Duration  // 检查节点耗时
+}
+
+func (n *Node) String() string {
+	return fmt.Sprintf("延迟:%s, %s", n.checkSpend, n.url)
+}
+
+func (n *Node) Valid() bool {
+	return n.alive && n.checkSpend >= 0
+}
+
+func (n *Node) Address() string {
+	return fmt.Sprintf("socks5://127.0.0.1:%d", n.listenPort)
+}
+
+func (n *Node) parse() (err error) {
+	switch {
+	case strings.HasPrefix(n.url, Vmess):
+		n.Vnexter, err = ParseVmess(n.url)
+	case strings.HasPrefix(n.url, Vless):
+		n.Vnexter, err = ParseVless(n.url)
+	case strings.HasPrefix(n.url, Trojan):
+		n.Vnexter, err = ParseTrojan(n.url)
+	default:
+		err = fmt.Errorf("invalid url: %s", n.url)
+	}
+	return
+}
+
+// Check 检查节点是否有效
+func (n *Node) Check(f CheckFunc) error {
+	var err error
+	n.checkSpend, err = f(n)
+	if err != nil {
+		return err
+	}
+	n.alive = n.checkSpend > 0
+	return nil
+}
+
+func (n *Node) Fail(url string) {
+	n.fail[url] = n.fail[url] + 1
+	if n.failLimit > 0 && len(n.fail) > n.failLimit {
+		n.alive = false
+	}
+	n.Stop()
+}
+
+func (n *Node) Start(port int, configDir string, cmd []string) error {
+
+	n.Stop()
+
+	n.listenPort = port
+
+	// 生成临时 V2Ray 配置
+	config := Config{
+		Log: DefaultLog,
+		Inbounds: []Bound{
+			{
+				Port:     port,
+				Listen:   "127.0.0.1",
+				Protocol: Socks,
+				Settings: Settings{
+					Udp: true,
+				},
+			},
+		},
+		Outbounds: []Bound{
+			{
+				Protocol: n.Protocol(),
+				Settings: Settings{
+					Vnext: []Vnext{n.Vnext()},
+				},
+			},
+		},
+	}
+
+	// 保存临时配置
+	file := fmt.Sprintf(configDir+"%d.json", port)
+	if err := os.WriteFile(file, config.Bytes(), 0644); err != nil {
+		return err
+	}
+
+	// 启动 V2Ray/Xray
+	name, args := cmd[0], append(cmd[1:], file)
+	c := exec.Command(name, args...)
+	if err := c.Start(); err != nil {
+		return err
+	}
+	n.process = c
+	return nil
+}
+
+func (n *Node) Stop() error {
+	if n.process == nil || n.process.Process == nil {
+		return nil
+	}
+	err := n.process.Process.Kill()
+	if err != nil {
+		return err
+	}
+	n.listenPort = -1
+	n.checkSpend = -1
+	n.process = nil
+	return nil
+}
