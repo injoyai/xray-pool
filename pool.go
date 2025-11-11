@@ -116,8 +116,9 @@ type Pool struct {
 	protocol   string    //协议
 
 	pool  chan *Node        //代理池
-	nodes types.List[*Node] //节点
+	nodes types.List[*Node] //全部节点
 	done  chan struct{}     //
+	once  sync.Once
 }
 
 func (p *Pool) Get() *Node {
@@ -155,6 +156,7 @@ func (p *Pool) Run() error {
 	p.start()
 
 	p.done = make(chan struct{})
+	p.once.Do(func() { close(p.done) })
 
 	exitChan := make(chan os.Signal)
 	signal.Notify(exitChan, os.Interrupt, os.Kill, syscall.SIGTERM)
@@ -170,10 +172,10 @@ func (p *Pool) Close() error {
 		n.Stop()
 	}
 	if p.done != nil {
-		close(p.done)
+		p.once.Do(func() { close(p.done) })
 	}
 	return nil
-	return os.RemoveAll(p.configDir)
+	//return os.RemoveAll(p.configDir)
 }
 
 func (p *Pool) subscribe() map[string]struct{} {
@@ -226,7 +228,6 @@ func (p *Pool) parseNode(u string) (*Node, error) {
 		url:        u,
 		listenPort: -1,
 		fail:       make(map[string]int),
-		alive:      true,
 	}
 	if err := n.parse(); err != nil {
 		return nil, err
@@ -250,6 +251,7 @@ func (p *Pool) check() {
 			err := n.check(p.checkFunc)
 			if err != nil {
 				logs.Warn(err)
+				return
 			}
 		}(n)
 	}
