@@ -10,6 +10,7 @@ const (
 	Trojan = "trojan"
 	Socks  = "socks"
 	Http   = "http"
+	Mixed  = "mixed"
 	None   = "none"
 )
 

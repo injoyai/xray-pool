@@ -22,6 +22,7 @@ const (
 	DefaultStartPort = 50000
 	DefaultPoolCap   = 1000
 	DefaultTimeout   = time.Second * 5
+	ErrInvalidPort   = types.Err("端口被占用")
 )
 
 var (
@@ -96,7 +97,7 @@ func New(op ...Option) *Pool {
 		checkFunc: ByPing,
 		pool:      make(chan *Node, DefaultPoolCap),
 		cmd:       XrayCmd,
-		protocol:  Http,
+		protocol:  Mixed,
 		done:      make(chan struct{}),
 	}
 	for _, o := range op {
@@ -254,15 +255,8 @@ func (p *Pool) check() {
 	}
 	wg.Wait()
 	p.nodes.Sort(func(a, b *Node) bool {
-		//if a.c
 		return a.checkSpend < b.checkSpend
 	})
-	for i, v := range p.nodes {
-		logs.Info(v.checkSpend)
-		if i >= 10 {
-			break
-		}
-	}
 }
 
 func (p *Pool) start() {
@@ -414,10 +408,13 @@ func (n *Node) Start(port int, protocol, configDir string, cmd []string) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 		//等待成功启动
-		if strings.Contains(line, "[Info] infra/conf/serial: Reading config:") {
+		switch {
+		case strings.Contains(line, "[Info] infra/conf/serial: Reading config:"):
 			atomic.StoreUint32(&n.running, 1)
 			n.process = c
-			break
+			return nil
+		case strings.Contains(line, "bind: Only one usage of each socket address"):
+			return ErrInvalidPort
 		}
 	}
 
