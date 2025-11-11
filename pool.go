@@ -247,7 +247,7 @@ func (p *Pool) check() {
 		wg.Add(1)
 		go func(n *Node) {
 			defer wg.Done()
-			err := n.Check(p.checkFunc)
+			err := n.check(p.checkFunc)
 			if err != nil {
 				logs.Warn(err)
 			}
@@ -294,7 +294,6 @@ type Node struct {
 	listenProtocol string         // 本地 V2Ray 实例协议
 	listenPort     int            // 本地 V2Ray 实例端口
 	process        *exec.Cmd      // 本地 V2Ray 进程
-	alive          bool           // 激活
 	fail           map[string]int // 请求地址对应的失败次数
 	failLimit      int            // 失败次数限制
 	checkSpend     time.Duration  // 检查节点耗时
@@ -306,8 +305,12 @@ func (n *Node) String() string {
 	return fmt.Sprintf("延迟:%s, %s", n.checkSpend, n.url)
 }
 
+func (n *Node) Closed() bool {
+	return atomic.LoadUint32(&n.running) == 0
+}
+
 func (n *Node) Valid() bool {
-	return n.alive && n.checkSpend >= 0
+	return n.checkSpend >= 0
 }
 
 func (n *Node) Address() string {
@@ -335,20 +338,16 @@ func (n *Node) parse() (err error) {
 }
 
 // Check 检查节点是否有效
-func (n *Node) Check(f CheckFunc) error {
+func (n *Node) check(f CheckFunc) error {
 	var err error
 	n.checkSpend, err = f(n)
-	if err != nil {
-		return err
-	}
-	n.alive = n.checkSpend > 0
-	return nil
+	return err
 }
 
 func (n *Node) Fail(url string) {
 	n.fail[url] = n.fail[url] + 1
 	if n.failLimit > 0 && len(n.fail) > n.failLimit {
-		n.alive = false
+		//todo
 	}
 	n.Stop()
 }
