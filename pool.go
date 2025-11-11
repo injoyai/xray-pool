@@ -1,6 +1,7 @@
 package xray_pool
 
 import (
+	"bufio"
 	"fmt"
 	"github.com/injoyai/base/types"
 	"github.com/injoyai/logs"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -81,6 +83,12 @@ func WithCmd(cmd []string) Option {
 	}
 }
 
+func WithProtocol(protocol string) Option {
+	return func(p *Pool) {
+		p.protocol = protocol
+	}
+}
+
 func New(op ...Option) *Pool {
 	p := &Pool{
 		configDir: DefaultConfigDir,
@@ -88,6 +96,7 @@ func New(op ...Option) *Pool {
 		checkFunc: ByPing,
 		pool:      make(chan *Node, DefaultPoolCap),
 		cmd:       XrayCmd,
+		protocol:  Http,
 		done:      make(chan struct{}),
 	}
 	for _, o := range op {
@@ -103,6 +112,7 @@ type Pool struct {
 	startPort  int       //起始端口
 	checkFunc  CheckFunc //检查节点是否可用,ping,tcp,download等
 	cmd        []string  //启动命令
+	protocol   string    //协议
 
 	pool  chan *Node        //代理池
 	nodes types.List[*Node] //节点
@@ -131,19 +141,16 @@ func (p *Pool) Do(f func(n *Node) error) error {
 func (p *Pool) Run() error {
 	p.Close()
 
-	//获取所有地址,去重
+	//获取所有节点地址,去重
 	m := p.subscribe()
 
 	//解析节点信息
-	logs.Info("parse...")
 	p.parse(m)
 
 	//校验节点
-	logs.Info("check...")
 	p.check()
 
 	//开始启动
-	logs.Info("start...")
 	p.start()
 
 	p.done = make(chan struct{})
@@ -151,10 +158,6 @@ func (p *Pool) Run() error {
 	exitChan := make(chan os.Signal)
 	signal.Notify(exitChan, os.Interrupt, os.Kill, syscall.SIGTERM)
 	go func() { <-exitChan; p.Close() }()
-
-	//if len(p.pool) == 0 {
-	//	return fmt.Errorf("pool is empty")
-	//}
 
 	<-p.done
 
@@ -168,6 +171,7 @@ func (p *Pool) Close() error {
 	if p.done != nil {
 		close(p.done)
 	}
+	return nil
 	return os.RemoveAll(p.configDir)
 }
 
@@ -233,11 +237,11 @@ func (p *Pool) check() {
 	if p.checkFunc == nil {
 		p.checkFunc = ByPing
 	}
-	logs.Info(len(p.nodes), " nodes")
 	wg := sync.WaitGroup{}
 	for _, n := range p.nodes {
 		if n == nil {
 			logs.Debug("n is nil")
+			continue
 		}
 		wg.Add(1)
 		go func(n *Node) {
@@ -265,7 +269,6 @@ func (p *Pool) start() {
 	if len(p.nodes) == 0 {
 		return
 	}
-
 	os.MkdirAll(p.configDir, os.ModePerm)
 	port := p.startPort
 	wg := sync.WaitGroup{}
@@ -274,12 +277,11 @@ func (p *Pool) start() {
 		if !n.Valid() {
 			logs.Warn("node is invalid")
 			wg.Done()
-			continue
+			return
 		}
-
 		go func(n *Node, port int) {
 			defer wg.Done()
-			if err := n.Start(port, p.configDir, p.cmd); err != nil {
+			if err := n.Start(port, p.protocol, p.configDir, p.cmd); err != nil {
 				logs.Warn(err)
 				return
 			}
@@ -287,20 +289,23 @@ func (p *Pool) start() {
 		}(n, port)
 		port++
 	}
-	wg.Done()
+	wg.Wait()
 }
 
 type Node struct {
 	Vnexter
 
-	name       string
-	url        string         // 原始 vmess:// 链接
-	listenPort int            // 本地 V2Ray 实例端口
-	process    *exec.Cmd      // 本地 V2Ray 进程
-	alive      bool           // 激活
-	fail       map[string]int // 请求地址对应的失败次数
-	failLimit  int            // 失败次数限制
-	checkSpend time.Duration  // 检查节点耗时
+	name           string
+	url            string         // 原始 vmess:// 链接
+	listenProtocol string         // 本地 V2Ray 实例协议
+	listenPort     int            // 本地 V2Ray 实例端口
+	process        *exec.Cmd      // 本地 V2Ray 进程
+	alive          bool           // 激活
+	fail           map[string]int // 请求地址对应的失败次数
+	failLimit      int            // 失败次数限制
+	checkSpend     time.Duration  // 检查节点耗时
+
+	running uint32
 }
 
 func (n *Node) String() string {
@@ -312,6 +317,12 @@ func (n *Node) Valid() bool {
 }
 
 func (n *Node) Address() string {
+	switch n.listenProtocol {
+	case Socks:
+		return fmt.Sprintf("socks5://127.0.0.1:%d", n.listenPort)
+	case Http:
+		return fmt.Sprintf("http://127.0.0.1:%d", n.listenPort)
+	}
 	return fmt.Sprintf("socks5://127.0.0.1:%d", n.listenPort)
 }
 
@@ -348,11 +359,12 @@ func (n *Node) Fail(url string) {
 	n.Stop()
 }
 
-func (n *Node) Start(port int, configDir string, cmd []string) error {
+func (n *Node) Start(port int, protocol, configDir string, cmd []string) error {
 
 	n.Stop()
 
 	n.listenPort = port
+	n.listenProtocol = protocol
 
 	// 生成临时 V2Ray 配置
 	config := Config{
@@ -360,19 +372,18 @@ func (n *Node) Start(port int, configDir string, cmd []string) error {
 		Inbounds: []Bound{
 			{
 				Port:     port,
-				Listen:   "127.0.0.1",
-				Protocol: Socks,
-				Settings: Settings{
+				Listen:   "0.0.0.0",
+				Protocol: protocol,
+				Settings: &Settings{
 					Udp: true,
 				},
 			},
 		},
 		Outbounds: []Bound{
 			{
-				Protocol: n.Protocol(),
-				Settings: Settings{
-					Vnext: []Vnext{n.Vnext()},
-				},
+				Protocol:       n.Protocol(),
+				Settings:       n.Settings(),
+				StreamSettings: n.StreamSettings(),
 			},
 		},
 	}
@@ -386,10 +397,30 @@ func (n *Node) Start(port int, configDir string, cmd []string) error {
 	// 启动 V2Ray/Xray
 	name, args := cmd[0], append(cmd[1:], file)
 	c := exec.Command(name, args...)
-	if err := c.Start(); err != nil {
+
+	stdout, err := c.StdoutPipe()
+	if err != nil {
 		return err
 	}
-	n.process = c
+	defer stdout.Close()
+
+	go func() {
+		err := c.Run()
+		logs.PrintErr(err)
+		atomic.StoreUint32(&n.running, 0)
+	}()
+
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		//等待成功启动
+		if strings.Contains(line, "[Info] infra/conf/serial: Reading config:") {
+			atomic.StoreUint32(&n.running, 1)
+			n.process = c
+			break
+		}
+	}
+
 	return nil
 }
 

@@ -18,7 +18,11 @@ func ByPing(n *Node) (time.Duration, error) {
 	if err = conn.SetDeadline(time.Now().Add(DefaultTimeout)); err != nil {
 		return 0, err
 	}
-	if _, err = conn.Write([]byte{8, 0, 0, 0, 0, 0, 0, 0}); err != nil {
+	if _, err = conn.Write([]byte{
+		8, 0, 247, 253, 0, 1, 0, 1, 0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0}); err != nil {
 		return 0, err
 	}
 	buf := make([]byte, 128)
