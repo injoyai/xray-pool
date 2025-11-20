@@ -1,7 +1,11 @@
 package xray_pool
 
 import (
+	"crypto/tls"
+	"fmt"
 	"net"
+	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -30,13 +34,37 @@ func ByPing(n *Node) (time.Duration, error) {
 	return time.Since(t), err
 }
 
-// ByDial 通过dial来判断
-func ByDial(n *Node) (time.Duration, error) {
+// ByTCP 通过dial来判断
+func ByTCP(n *Node) (time.Duration, error) {
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", n.Address(), DefaultTimeout)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", n.Hostname(), n.Port()), DefaultTimeout)
 	if err != nil {
 		return 0, err
 	}
 	_ = conn.Close()
+	return time.Since(start), nil
+}
+
+func ByGoogle(n *Node) (time.Duration, error) {
+	start := time.Now()
+	u, err := url.Parse(n.Proxy())
+	if err != nil {
+		return 0, err
+	}
+	h := &http.Client{
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			Proxy: http.ProxyURL(u),
+		},
+		Timeout: time.Second * 10,
+	}
+	resp, err := h.Get("https://www.google.com")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
 	return time.Since(start), nil
 }

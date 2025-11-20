@@ -3,15 +3,17 @@ package xray_pool
 import (
 	"encoding/base64"
 	"encoding/json"
-	"github.com/injoyai/conv"
 	"net/url"
 	"strings"
+
+	"github.com/injoyai/conv"
 )
 
 type Vnexter interface {
 	Remark() string
 	Protocol() string
 	Hostname() string
+	Port() int
 	Settings() *Settings
 	StreamSettings() *StreamSettings
 }
@@ -38,6 +40,7 @@ func ParseVless(raw string) (*VlessConfig, error) {
 	return &VlessConfig{
 		remark:   remark,
 		hostname: u.Hostname(),
+		port:     conv.Int(u.Port()),
 		settings: &Settings{
 			Vnext: []Vnext{
 				{
@@ -73,6 +76,7 @@ func ParseVless(raw string) (*VlessConfig, error) {
 type VlessConfig struct {
 	remark         string
 	hostname       string
+	port           int
 	settings       *Settings
 	streamSettings *StreamSettings
 }
@@ -88,6 +92,8 @@ func (c *VlessConfig) Protocol() string {
 func (c *VlessConfig) Hostname() string {
 	return c.hostname
 }
+
+func (c *VlessConfig) Port() int { return c.port }
 
 func (c *VlessConfig) Settings() *Settings {
 	return c.settings
@@ -121,7 +127,7 @@ func ParseVmess(u string) (*VmessConfig, error) {
 
 type VmessConfig struct {
 	Hostname_ string `json:"host"`
-	Port      string `json:"port"`
+	Port_     string `json:"port"`
 	UID       string `json:"id"`
 	AlterID   string `json:"aid"`
 	Remark_   string `json:"ps"`
@@ -144,12 +150,14 @@ func (c *VmessConfig) Hostname() string {
 	return c.Hostname_
 }
 
+func (c *VmessConfig) Port() int { return conv.Int(c.Port_) }
+
 func (c *VmessConfig) Settings() *Settings {
 	return &Settings{
 		Vnext: []Vnext{
 			{
 				Address: c.Hostname_,
-				Port:    conv.Int(c.Port),
+				Port:    c.Port(),
 				Users: []User{{
 					ID:         c.UID,
 					AlterId:    conv.Int(c.AlterID),
@@ -206,6 +214,7 @@ func ParseTrojan(raw string) (*TrojanConfig, error) {
 	return &TrojanConfig{
 		remark:   remark,
 		hostname: u.Hostname(),
+		port:     conv.Int(port),
 		settings: &Settings{
 			Servers: []Server{
 				{
@@ -221,6 +230,7 @@ func ParseTrojan(raw string) (*TrojanConfig, error) {
 type TrojanConfig struct {
 	remark         string
 	hostname       string
+	port           int
 	settings       *Settings
 	streamSettings *StreamSettings
 }
@@ -231,6 +241,8 @@ func (c *TrojanConfig) Protocol() string { return Trojan }
 func (c *TrojanConfig) Hostname() string {
 	return c.settings.Servers[0].Address
 }
+
+func (c *TrojanConfig) Port() int { return c.port }
 
 func (c *TrojanConfig) Settings() *Settings {
 	return c.settings

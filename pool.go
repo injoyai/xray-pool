@@ -3,8 +3,6 @@ package xray_pool
 import (
 	"bufio"
 	"fmt"
-	"github.com/injoyai/base/types"
-	"github.com/injoyai/logs"
 	"io"
 	"net/http"
 	"os"
@@ -15,6 +13,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/injoyai/base/types"
+	"github.com/injoyai/logs"
 )
 
 const (
@@ -56,9 +57,15 @@ func WithStartPort(port int) Option {
 	}
 }
 
-func WithCheck(check CheckFunc) Option {
+func WithNodeCheck(check CheckFunc) Option {
 	return func(p *Pool) {
-		p.checkFunc = check
+		p.nodeFunc = check
+	}
+}
+
+func WithProxyCheck(check CheckFunc) Option {
+	return func(p *Pool) {
+		p.proxyCheck = check
 	}
 }
 
@@ -92,13 +99,15 @@ func WithProtocol(protocol string) Option {
 
 func New(op ...Option) *Pool {
 	p := &Pool{
-		configDir: DefaultConfigDir,
-		startPort: DefaultStartPort,
-		checkFunc: ByPing,
-		pool:      make(chan *Node, DefaultPoolCap),
-		cmd:       XrayCmd,
-		protocol:  Mixed,
-		done:      make(chan struct{}),
+		configDir:  DefaultConfigDir,
+		startPort:  DefaultStartPort,
+		nodeFunc:   ByPing,
+		proxyCheck: ByGoogle,
+		pool:       make(chan *Node, DefaultPoolCap),
+		cmd:        XrayCmd,
+		protocol:   Mixed,
+		done:       make(chan struct{}),
+		started:    make(chan struct{}),
 	}
 	for _, o := range op {
 		o(p)
@@ -111,14 +120,17 @@ type Pool struct {
 	nodeUrls   []string  //节点地址
 	configDir  string    //配置目录
 	startPort  int       //起始端口
-	checkFunc  CheckFunc //检查节点是否可用,ping,tcp,download等
+	nodeFunc   CheckFunc //检查节点是否可用,ping,tcp,download等
+	proxyCheck CheckFunc //代理请求校验
 	cmd        []string  //启动命令
 	protocol   string    //协议
 
-	pool  chan *Node        //代理池
-	nodes types.List[*Node] //全部节点
-	done  chan struct{}     //
-	once  sync.Once
+	pool     chan *Node        //代理池
+	allNodes types.List[*Node] //全部节点
+	valid    types.List[*Node] //有效节点
+	done     chan struct{}     //
+	once     sync.Once
+	started  chan struct{}
 }
 
 func (p *Pool) Get() *Node {
@@ -132,6 +144,10 @@ func (p *Pool) Put(n *Node) {
 
 func (p *Pool) Len() int {
 	return len(p.pool)
+}
+
+func (p *Pool) Started() <-chan struct{} {
+	return p.started
 }
 
 func (p *Pool) Do(f func(n *Node) error) error {
@@ -168,7 +184,7 @@ func (p *Pool) Run() error {
 }
 
 func (p *Pool) Close() error {
-	for _, n := range p.nodes {
+	for _, n := range p.allNodes {
 		n.Stop()
 	}
 	if p.done != nil {
@@ -219,13 +235,13 @@ func (p *Pool) parse(m map[string]struct{}) {
 			logs.Warn(err)
 			continue
 		}
-		p.nodes = append(p.nodes, n)
+		p.allNodes = append(p.allNodes, n)
 	}
 }
 
 func (p *Pool) parseNode(u string) (*Node, error) {
 	n := &Node{
-		url:        u,
+		origin:     u,
 		listenPort: -1,
 		fail:       make(map[string]int),
 	}
@@ -236,64 +252,68 @@ func (p *Pool) parseNode(u string) (*Node, error) {
 }
 
 func (p *Pool) check() {
-	if p.checkFunc == nil {
-		p.checkFunc = ByPing
+	if p.nodeFunc == nil {
+		p.nodeFunc = ByPing
 	}
 	wg := sync.WaitGroup{}
-	for _, n := range p.nodes {
+	for _, n := range p.allNodes {
 		if n == nil {
-			logs.Debug("n is nil")
+			//logs.Debug("n is nil")
 			continue
 		}
 		wg.Add(1)
 		go func(n *Node) {
 			defer wg.Done()
-			err := n.check(p.checkFunc)
+			err := n.check(p.nodeFunc)
 			if err != nil {
-				logs.Warn(err)
+				//logs.Warn(err)
 				return
 			}
+			p.valid = append(p.valid, n)
 		}(n)
 	}
 	wg.Wait()
-	p.nodes.Sort(func(a, b *Node) bool {
+	p.valid.Sort(func(a, b *Node) bool {
 		return a.checkSpend < b.checkSpend
 	})
 }
 
 func (p *Pool) start() {
-	if len(p.nodes) == 0 {
+	if len(p.valid) == 0 {
 		return
 	}
 	os.MkdirAll(p.configDir, os.ModePerm)
 	port := p.startPort
 	wg := sync.WaitGroup{}
-	wg.Add(len(p.nodes))
-	for _, n := range p.nodes {
-		if !n.Valid() {
-			logs.Warn("node is invalid")
-			wg.Done()
-			return
-		}
+	wg.Add(len(p.valid))
+	for _, n := range p.valid {
 		go func(n *Node, port int) {
 			defer wg.Done()
 			if err := n.Start(port, p.protocol, p.configDir, p.cmd); err != nil {
-				logs.Warn(err)
+				//logs.Warn(err)
 				return
 			}
+			if p.proxyCheck != nil {
+				if _, err := p.proxyCheck(n); err != nil {
+					//logs.Warn(err)
+					n.Stop()
+					return
+				}
+			}
+			logs.Info(n.Proxy(), "->", n.Origin())
 			p.pool <- n
 		}(n, port)
 		port++
 	}
 	wg.Wait()
+	close(p.started)
 }
 
 type Node struct {
 	Vnexter
 
-	name           string
-	url            string         // 原始 vmess:// 链接
-	listenProtocol string         // 本地 V2Ray 实例协议
+	origin         string         // 原始 vmess:// 链接
+	listenProtocol string         // 本地 V2Ray 实例协议 http socks
 	listenPort     int            // 本地 V2Ray 实例端口
 	process        *exec.Cmd      // 本地 V2Ray 进程
 	fail           map[string]int // 请求地址对应的失败次数
@@ -304,22 +324,22 @@ type Node struct {
 }
 
 func (n *Node) String() string {
-	return fmt.Sprintf("延迟:%s, %s", n.checkSpend, n.url)
+	return fmt.Sprintf("延迟:%s, %s", n.checkSpend, n.origin)
 }
 
 func (n *Node) Closed() bool {
 	return atomic.LoadUint32(&n.running) == 0
 }
 
-func (n *Node) Valid() bool {
-	return n.checkSpend >= 0
+func (n *Node) Origin() string {
+	return n.origin
 }
 
-func (n *Node) Address() string {
+func (n *Node) Proxy() string {
 	switch n.listenProtocol {
 	case Socks:
 		return fmt.Sprintf("socks5://127.0.0.1:%d", n.listenPort)
-	case Http:
+	case Http, Mixed:
 		return fmt.Sprintf("http://127.0.0.1:%d", n.listenPort)
 	}
 	return fmt.Sprintf("socks5://127.0.0.1:%d", n.listenPort)
@@ -327,14 +347,14 @@ func (n *Node) Address() string {
 
 func (n *Node) parse() (err error) {
 	switch {
-	case strings.HasPrefix(n.url, Vmess):
-		n.Vnexter, err = ParseVmess(n.url)
-	case strings.HasPrefix(n.url, Vless):
-		n.Vnexter, err = ParseVless(n.url)
-	case strings.HasPrefix(n.url, Trojan):
-		n.Vnexter, err = ParseTrojan(n.url)
+	case strings.HasPrefix(n.origin, Vmess):
+		n.Vnexter, err = ParseVmess(n.origin)
+	case strings.HasPrefix(n.origin, Vless):
+		n.Vnexter, err = ParseVless(n.origin)
+	case strings.HasPrefix(n.origin, Trojan):
+		n.Vnexter, err = ParseTrojan(n.origin)
 	default:
-		err = fmt.Errorf("invalid url: %s", n.url)
+		err = fmt.Errorf("invalid protocol, must be [vmess|vless|trojan]: %s", n.origin)
 	}
 	return
 }
@@ -346,13 +366,13 @@ func (n *Node) check(f CheckFunc) error {
 	return err
 }
 
-func (n *Node) Fail(url string) {
-	n.fail[url] = n.fail[url] + 1
-	if n.failLimit > 0 && len(n.fail) > n.failLimit {
-		//todo
-	}
-	n.Stop()
-}
+//func (n *Node) Fail(url string) {
+//	n.fail[url] = n.fail[url] + 1
+//	if n.failLimit > 0 && len(n.fail) > n.failLimit {
+//		//todo
+//	}
+//	n.Stop()
+//}
 
 func (n *Node) Start(port int, protocol, configDir string, cmd []string) error {
 
@@ -401,7 +421,8 @@ func (n *Node) Start(port int, protocol, configDir string, cmd []string) error {
 
 	go func() {
 		err := c.Run()
-		logs.PrintErr(err)
+		_ = err
+		//logs.PrintErr(err)
 		atomic.StoreUint32(&n.running, 0)
 	}()
 
